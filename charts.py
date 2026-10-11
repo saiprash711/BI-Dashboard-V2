@@ -17,6 +17,10 @@ import theme as T
 from data_engine import MONTH_ORDER
 
 
+def _rev_col(df: pd.DataFrame) -> str:
+    return "Total Income (Ex GST)" if "Total Income (Ex GST)" in df.columns else "Total Income"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 def style(fig: go.Figure, height: int = 360, title: str | None = None,
           legend_top: bool = True, y_prefix: str | None = None,
@@ -140,8 +144,9 @@ def avg_bid_trend(pf: pd.DataFrame) -> go.Figure:
 def state_donut(df: pd.DataFrame) -> go.Figure:
     if "State" not in df.columns or df.empty:
         return empty()
+    rev_c = _rev_col(df)
     g = (df.groupby("State")
-           .agg(Transactions=("Final Bid Value", "size"), Revenue=("Total Income", "sum"))
+           .agg(Transactions=("Final Bid Value", "size"), Revenue=(rev_c, "sum"))
            .reset_index().sort_values("Transactions", ascending=False))
     fig = go.Figure(go.Pie(
         labels=g["State"], values=g["Transactions"], hole=.62, sort=False,
@@ -164,8 +169,9 @@ def state_performance(df: pd.DataFrame) -> go.Figure:
     """Horizontal bars: revenue per state with take rate annotated."""
     if "State" not in df.columns or df.empty:
         return empty()
+    rev_c = _rev_col(df)
     g = (df.groupby("State")
-           .agg(GMV=("Final Bid Value", "sum"), Revenue=("Total Income", "sum"),
+           .agg(GMV=("Final Bid Value", "sum"), Revenue=(rev_c, "sum"),
                 Transactions=("Final Bid Value", "size"))
            .reset_index())
     g["TakeRate"] = np.where(g["GMV"] > 0, g["Revenue"] / g["GMV"] * 100, 0)
@@ -191,12 +197,13 @@ def segment_split(df: pd.DataFrame) -> go.Figure:
     """Captive vs Non-Captive across the metrics that matter."""
     if "Seller Segment" not in df.columns or df.empty:
         return empty()
+    rev_c = _rev_col(df)
     g = (df.groupby("Seller Segment")
            .agg(Transactions=("Final Bid Value", "size"),
                 GMV=("Final Bid Value", "sum"),
-                Revenue=("Total Income", "sum"),
+                Revenue=(rev_c, "sum"),
                 AvgBid=("Final Bid Value", "mean"),
-                AvgCommission=("Total Income", "mean"))
+                AvgCommission=(rev_c, "mean"))
            .reset_index())
     g["TakeRate"] = np.where(g["GMV"] > 0, g["Revenue"] / g["GMV"] * 100, 0)
     g["TxnShare"] = g["Transactions"] / g["Transactions"].sum() * 100
@@ -232,10 +239,11 @@ def segment_split(df: pd.DataFrame) -> go.Figure:
 def make_treemap(df: pd.DataFrame, top: int = 18) -> go.Figure:
     if "Make" not in df.columns or df.empty:
         return empty(height=420)
+    rev_c = _rev_col(df)
     g = (df.groupby("Make")
            .agg(Transactions=("Final Bid Value", "size"),
                 GMV=("Final Bid Value", "sum"),
-                Revenue=("Total Income", "sum"),
+                Revenue=(rev_c, "sum"),
                 AvgBid=("Final Bid Value", "mean"))
            .reset_index().sort_values("GMV", ascending=False).head(top))
     fig = go.Figure(go.Treemap(
@@ -260,10 +268,11 @@ def make_treemap(df: pd.DataFrame, top: int = 18) -> go.Figure:
 def top_models(df: pd.DataFrame, n: int = 12) -> go.Figure:
     if "Model" not in df.columns or df.empty:
         return empty(height=420)
+    rev_c = _rev_col(df)
     g = (df.groupby("Model")
            .agg(Transactions=("Final Bid Value", "size"),
                 AvgBid=("Final Bid Value", "mean"),
-                Revenue=("Total Income", "sum"))
+                Revenue=(rev_c, "sum"))
            .reset_index().sort_values("Transactions", ascending=False).head(n)
            .sort_values("Transactions"))
     fig = go.Figure(go.Bar(
@@ -376,7 +385,8 @@ def cohort_heatmap(df: pd.DataFrame, index: str, title: str) -> go.Figure:
     """Revenue heatmap of a dimension against period."""
     if index not in df.columns or "Period" not in df.columns or df.empty:
         return empty(height=380)
-    piv = (df.pivot_table(index=index, columns="Period", values="Total Income",
+    rev_c = _rev_col(df)
+    piv = (df.pivot_table(index=index, columns="Period", values=rev_c,
                           aggfunc="sum", observed=False)
              .fillna(0))
     if piv.empty:

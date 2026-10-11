@@ -6,6 +6,7 @@ Run with:  python -m streamlit run app.py
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime
 from io import BytesIO
 
@@ -21,6 +22,11 @@ import chatbot as CB
 import data_engine as DE
 import theme as T
 from fmt import inr, inr_full, num
+
+# Guard against Streamlit hot-reloader partial module caching
+if not hasattr(DE, "export_normalised_workbook"):
+    import importlib
+    DE = importlib.reload(DE)
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -151,6 +157,17 @@ def quality_of(df: pd.DataFrame):
     return DE.compute_quality(df)
 
 
+@st.cache_data(show_spinner=False)
+def export_normalised_cached(df: pd.DataFrame, source_name: str, notes_tuple: tuple[str, ...]) -> bytes:
+    fn = getattr(DE, "export_normalised_workbook", None)
+    if fn is None:
+        import importlib
+        reloaded = importlib.reload(DE)
+        fn = getattr(reloaded, "export_normalised_workbook")
+    return fn(df, source_name=source_name, notes=list(notes_tuple))
+
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # INSIGHTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,7 +188,8 @@ def build_insights(fdf: pd.DataFrame, pf: pd.DataFrame, m: dict,
 
     # Geographic concentration
     if "State" in fdf.columns and fdf["State"].notna().any():
-        g = fdf.groupby("State")["Total Income"].sum().sort_values(ascending=False)
+        rev_col = "Total Income (Ex GST)" if "Total Income (Ex GST)" in fdf.columns else "Total Income"
+        g = fdf.groupby("State")[rev_col].sum().sort_values(ascending=False)
         top, share = g.index[0], g.iloc[0] / g.sum() * 100 if g.sum() else 0
         acc = "amber" if share > 55 else "teal"
         risk = ("a concentration risk worth diversifying"
@@ -192,8 +210,9 @@ def build_insights(fdf: pd.DataFrame, pf: pd.DataFrame, m: dict,
 
     # Segment economics
     if "Seller Segment" in fdf.columns and fdf["Seller Segment"].nunique() > 1:
+        rev_col = "Total Income (Ex GST)" if "Total Income (Ex GST)" in fdf.columns else "Total Income"
         seg = (fdf.groupby("Seller Segment")
-                  .agg(rev=("Total Income", "sum"), gmv=("Final Bid Value", "sum"),
+                  .agg(rev=(rev_col, "sum"), gmv=("Final Bid Value", "sum"),
                        n=("Final Bid Value", "size")))
         seg["take"] = seg["rev"] / seg["gmv"] * 100
         best = seg["take"].idxmax()
@@ -431,8 +450,24 @@ def sidebar_controls(df: pd.DataFrame, source_label: str, source_path: str | Non
 
         st.divider()
         if st.session_state.get("uploaded") is not None:
+            up_name = st.session_state.get("uploaded_name", "dataset")
+            base = os.path.splitext(up_name)[0]
+            clean_base = re.sub(r"[\s_]+(normalised|standardised)$", "", base, flags=re.IGNORECASE)
+            notes_tuple = tuple(st.session_state.get("uploaded_notes", []))
+            dl_bytes = export_normalised_cached(df, up_name, notes_tuple)
+            st.download_button(
+                "⤓  Download normalised (Excel)",
+                data=dl_bytes,
+                file_name=f"{clean_base}_normalised.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width="stretch",
+                key="sb_dl_normalised_excel",
+                help="Download the currently active normalised dataset as a formatted Excel workbook",
+            )
             if st.button("↺ Restore bundled dataset", width="stretch"):
                 st.session_state.uploaded = None
+                st.session_state.uploaded_name = ""
+                st.session_state.uploaded_notes = []
                 st.rerun()
         st.caption(f"Rendered {datetime.now():%d %b %Y · %H:%M}")
 
@@ -484,11 +519,11 @@ def tab_overview(fdf: pd.DataFrame):
         ("GMV", inr(m["gmv"]), "◈", "violet", deltas.get("gmv"),
          f"avg deal {inr(m['avg_txn_value'])}"),
         ("Commission revenue", inr(m["revenue"]), "◆", "amber", deltas.get("revenue"),
-         "excluding GST"),
+         f"ex GST · Total {inr(m['total_income'])} inc GST"),
         ("Take rate", f"{m['take_rate']:.2f}%", "◐", "teal", deltas.get("take_rate"),
-         "revenue ÷ GMV"),
+         "revenue (ex GST) ÷ GMV"),
         ("Avg. commission", inr(m["avg_commission"]), "◇", "rose",
-         deltas.get("avg_commission"), "per transaction"),
+         deltas.get("avg_commission"), "net per deal (ex GST)"),
     ]
     for col, (lbl, val, ico, acc, dv, sub) in zip(r1, cards):
         with col:
@@ -589,30 +624,38 @@ def _perf_table(perf: pd.DataFrame, label_col: str, count_col: str, n: int,
     # Keep the GMV-share bars comparable regardless of the active search.
     share_max = float(max(perf["GMVShare"].max(), 1))
 
-    show = pd.DataFrame({
+    show_dict = {
         label_col: d[label_col],
         count_col: d[count_col],
         "GMV": d["GMV"],
         "GMV share %": d["GMVShare"].round(2),
         "Avg. transaction value": d["AvgTxnValue"],
-        "Commission": d["Commission"],
-        "Avg. commission": d["AvgCommission"],
-        "Take rate %": d["TakeRate"].round(2),
-    })
+        "Commission (Ex GST)": d["Commission"],
+    }
+    if "TotalIncome" in d.columns:
+        show_dict["Total Income (Inc GST)"] = d["TotalIncome"]
+    show_dict["Avg. commission"] = d["AvgCommission"]
+    show_dict["Take rate %"] = d["TakeRate"].round(2)
+    show = pd.DataFrame(show_dict)
+
+    column_config = {
+        count_col: st.column_config.NumberColumn(count_col, format="%d", width="small"),
+        "GMV": st.column_config.NumberColumn("GMV", format="₹%.0f"),
+        "GMV share %": st.column_config.ProgressColumn(
+            "GMV share", format="%.2f%%", min_value=0.0,
+            max_value=share_max),
+        "Avg. transaction value": st.column_config.NumberColumn(
+            "Avg. txn value", format="₹%.0f"),
+        "Commission (Ex GST)": st.column_config.NumberColumn("Commission (Ex GST)", format="₹%.0f"),
+        "Avg. commission": st.column_config.NumberColumn("Avg. commission", format="₹%.0f"),
+        "Take rate %": st.column_config.NumberColumn("Take rate", format="%.2f%%"),
+    }
+    if "TotalIncome" in d.columns:
+        column_config["Total Income (Inc GST)"] = st.column_config.NumberColumn("Total Income (Inc GST)", format="₹%.0f")
+
     st.dataframe(
         show, width="stretch", hide_index=True, height=min(520, 42 + 35 * len(show)),
-        column_config={
-            count_col: st.column_config.NumberColumn(count_col, format="%d", width="small"),
-            "GMV": st.column_config.NumberColumn("GMV", format="₹%.0f"),
-            "GMV share %": st.column_config.ProgressColumn(
-                "GMV share", format="%.2f%%", min_value=0.0,
-                max_value=share_max),
-            "Avg. transaction value": st.column_config.NumberColumn(
-                "Avg. txn value", format="₹%.0f"),
-            "Commission": st.column_config.NumberColumn("Commission", format="₹%.0f"),
-            "Avg. commission": st.column_config.NumberColumn("Avg. commission", format="₹%.0f"),
-            "Take rate %": st.column_config.NumberColumn("Take rate", format="%.2f%%"),
-        },
+        column_config=column_config,
     )
 
 
@@ -684,17 +727,266 @@ def tab_performance(fdf: pd.DataFrame):
     st.markdown(T.section("Export", "take the filtered slice with you"),
                 unsafe_allow_html=True)
     export = fdf.drop(columns=[c for c in ("_month_idx",) if c in fdf.columns])
-    st.download_button(
-        "⤓  Download filtered data (CSV)",
-        data=export.to_csv(index=False).encode("utf-8"),
-        file_name=f"conversion_filtered_{datetime.now():%Y%m%d_%H%M}.csv",
-        mime="text/csv",
-    )
+    ts_now = datetime.now().strftime("%Y%m%d_%H%M")
+    e_col1, e_col2 = st.columns(2)
+    with e_col1:
+        excel_filtered = export_normalised_cached(fdf, "Filtered Slice", ())
+        st.download_button(
+            "⤓  Download filtered data (Excel)",
+            data=excel_filtered,
+            file_name=f"conversion_filtered_{ts_now}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+            key="dl_perf_excel",
+            help="Download currently filtered slice as a formatted Excel workbook",
+        )
+    with e_col2:
+        st.download_button(
+            "⤓  Download filtered data (CSV)",
+            data=export.to_csv(index=False).encode("utf-8"),
+            file_name=f"conversion_filtered_{ts_now}.csv",
+            mime="text/csv",
+            width="stretch",
+            key="dl_perf_csv",
+            help="Download currently filtered slice as plain CSV",
+        )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TAB 3 — UPLOAD
 # ═════════════════════════════════════════════════════════════════════════════
+def _render_upload_verification(
+    df: pd.DataFrame,
+    notes: list[str],
+    source_name: str,
+    raw_bytes: bytes | None = None,
+    is_active_session: bool = False,
+):
+    m = DE.compute_metrics(df)
+    q = quality_of(df)
+    g_txt, g_acc = DE.grade(q["overall"])
+
+    # 1. Single Source of Truth Financial Reconciliation
+    st.markdown(T.section("Single source of truth (SSOT)", "reconciled financials, lineage and grain"),
+                unsafe_allow_html=True)
+
+    cols = st.columns(5)
+    preview = [
+        ("Records", num(len(df)), "▦", "jade"),
+        ("Total GMV", inr(m["gmv"]), "◈", "violet"),
+        ("Commission (Ex GST)", inr(m["revenue"]), "◆", "amber"),
+        ("Total Income (Inc GST)", inr(m["total_income"]), "◇", "teal"),
+        ("Quality score", f"{q['overall']:.1f}%", "◉", g_acc),
+    ]
+    for col, (lbl, val, ico, acc) in zip(cols, preview):
+        with col:
+            st.markdown(T.kpi_card(lbl, val, ico, acc), unsafe_allow_html=True)
+
+    # Reconciliation mathematical detail
+    c_rec1, c_rec2 = st.columns([1.6, 1])
+    with c_rec1:
+        st.markdown(
+            '<div class="panel"><h4>◈ Revenue & Tax Reconciliation</h4>'
+            '<div style="display:flex;justify-content:space-between;align-items:center;margin:.4rem 0">'
+            f'<span>Net Commission (Ex GST): <b>{inr(m.get("revenue", 0.0))}</b></span>'
+            f'<span style="color:var(--text-dim)">+</span>'
+            f'<span>GST Component (18%): <b>{inr(m.get("gst", m.get("gst_amount", 0.0)))}</b></span>'
+            f'<span style="color:var(--text-dim)">=</span>'
+            f'<span style="color:var(--jade);font-weight:700">Total Billing (Inc GST): {inr(m.get("total_income", 0.0))}</span>'
+            '</div>'
+            '<p class="small-note" style="margin-top:.4rem">Every platform revenue figure is strictly reconciled. '
+            'Net take rate reflects actual platform fee yield against gross merchandise value.</p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+    with c_rec2:
+        st.markdown(
+            '<div class="panel"><h4>◐ Lineage & Grain</h4>'
+            f'<div class="sb-stat"><span>Declared Grain</span><b>1 Row = 1 Vehicle</b></div>'
+            f'<div class="sb-stat"><span>Net Take Rate</span><b>{m["take_rate"]:.2f}%</b></div>'
+            f'<div class="sb-stat"><span>Gross Take Rate</span><b>{(m["total_income"] / m["gmv"] * 100 if m["gmv"] else 0):.2f}%</b></div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+    # 2. Data Quality Scorecard (4 Pillars)
+    st.markdown(T.section("Data quality scorecard", "evaluated across four core pillars"),
+                unsafe_allow_html=True)
+    q_cols = st.columns(4)
+    dim_meta = [
+        ("Completeness", q["completeness"], f"{q['null_cells']:,} empty cells", "jade"),
+        ("Uniqueness", q["uniqueness"], f"{q['duplicate_rows']:,} duplicate rows", "teal"),
+        ("Validity", q["validity"], f"{q['invalid_rows']:,} row(s) breaking rules", "amber"),
+        ("Consistency", q["consistency"], f"{q['consistency_rows_affected']:,} variants resolved", "violet"),
+    ]
+    for col, (lbl, val, note, acc) in zip(q_cols, dim_meta):
+        with col:
+            st.markdown(T.score_card(lbl, f"{val:.1f}%", note, acc, pct=val), unsafe_allow_html=True)
+
+    # 3. Data Standardisation & Similarity Verification
+    st.markdown(T.section("Data standardisation & similarity verification",
+                          "inspect and verify canonical entities, body style segregation and deduplication"),
+                unsafe_allow_html=True)
+
+    st.markdown(
+        '<div class="panel" style="border-left:4px solid var(--jade);margin-bottom:.8rem">'
+        '<h4>◈ Automated Standardisation Rules & Body Style Separation</h4>'
+        '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:.8rem;margin-top:.5rem">'
+        '<div><strong>🚗 Model & Body Style Integrity:</strong> Sedan and Hatchback counterparts are strictly segregated. '
+        '<code>Swift</code> (Hatchback) and <code>Dzire</code> (Sedan, 124 records consolidated) remain distinct models. '
+        'Likewise: <code>Tiago</code> (Hatch) vs <code>Tigor</code> (Sedan), <code>Figo</code> vs <code>Aspire</code>, '
+        '<code>Etios</code> vs <code>Etios Liva</code>, <code>Polo</code> vs <code>Vento</code>, and <code>Grand i10</code> vs <code>Xcent</code>.</div>'
+        '<div><strong>🏢 Seller Dealership Deduplication:</strong> Corporate entity suffixes are consolidated '
+        '(e.g. <code>AADHI CARS</code> &rarr; <code>AADHI CARS PRIVATE LIMITED</code>), and authorized dealer branch typos '
+        '(e.g. <code>AA Cars Madhurai</code> &rarr; <code>AA CARS</code>, <code>Castel Traders</code> &rarr; <code>CASTLE TRADERS</code>) are mapped to canonical entities.</div>'
+        '<div><strong>👤 Buyer Account Cleanliness:</strong> Buyer casing, spacing, and duplicate trade accounts '
+        'are unified into standardized title-case entities.</div>'
+        '<div><strong>🏷️ Vehicle Make Casing:</strong> Brand names (e.g. <code>MARUTI</code> &rarr; <code>MARUTI SUZUKI</code>, <code>VW</code> &rarr; <code>VOLKSWAGEN</code>) '
+        'are canonicalized to standard uppercase brand names.</div>'
+        '</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    # Retrieve standardization audit
+    audit = getattr(df, "attrs", {}).get("standardization_audit", {})
+    if not audit or not any(isinstance(v, pd.DataFrame) and not v.empty for v in audit.values()):
+        if raw_bytes:
+            try:
+                raw_df = pd.read_excel(BytesIO(raw_bytes), sheet_name=0, header=None)
+                hdr = DE._find_header_row(raw_df)
+                if hdr is not None:
+                    parsed_raw = raw_df.iloc[hdr + 1:].copy()
+                    raw_cols = [str(c).strip() for c in raw_df.iloc[hdr].tolist()]
+                    renames = {c: DE._COL_ALIASES.get(re.sub(r"\s+", " ", c).strip().lower(), c) for c in raw_cols}
+                    parsed_raw.columns = [renames.get(c, c) for c in raw_cols]
+                    parsed_raw = parsed_raw.loc[:, ~parsed_raw.columns.duplicated()]
+                    parsed_raw = parsed_raw.dropna(how="all").reset_index(drop=True)
+                    audit = DE.extract_standardization_audit(parsed_raw, df)
+            except Exception:
+                pass
+
+    t_mod, t_sel, t_buy, t_mak = st.tabs([
+        "🚗  Models (Hatchback vs Sedan & Aliases)",
+        "🏢  Sellers (Dealerships & Corporate Suffixes)",
+        "👤  Buyers (Accounts & Casing)",
+        "🏷️  Makes (Brands)",
+    ])
+
+    def _render_audit_table(audit_df: pd.DataFrame, entity_name: str, placeholder: str, key_suffix: str):
+        if audit_df.empty:
+            st.success(f"All {entity_name.lower()}s conformed directly to canonical standards.")
+            return
+        tot_records = int(audit_df["Records Affected"].sum())
+        search = st.text_input(
+            f"Search {entity_name} changes",
+            key=f"audit_search_{key_suffix}_{'active' if is_active_session else 'up'}",
+            placeholder=placeholder,
+        ).strip()
+        if search:
+            mask = (
+                audit_df["Raw Input in Excel"].astype(str).str.contains(search, case=False, na=False) |
+                audit_df["Standardised Canonical Value"].astype(str).str.contains(search, case=False, na=False) |
+                audit_df["Standardisation Rule / Body Style Reason"].astype(str).str.contains(search, case=False, na=False)
+            )
+            filtered = audit_df[mask]
+        else:
+            filtered = audit_df
+
+        st.caption(f"{len(filtered)} standardisation rule(s) matching · affecting {filtered['Records Affected'].sum():,} of {tot_records:,} raw records.")
+        st.dataframe(
+            filtered,
+            width="stretch",
+            hide_index=True,
+            height=min(420, 42 + 35 * len(filtered)),
+            column_config={
+                "Raw Input in Excel": st.column_config.TextColumn("Raw Input in Excel", width="medium"),
+                "Standardised Canonical Value": st.column_config.TextColumn("Standardised Canonical Value", width="medium"),
+                "Records Affected": st.column_config.NumberColumn("Records Affected", format="%d", width="small"),
+                "Standardisation Rule / Body Style Reason": st.column_config.TextColumn("Rule / Reason", width="large"),
+            },
+        )
+
+    with t_mod:
+        df_models = audit.get("models", pd.DataFrame()) if isinstance(audit, dict) else pd.DataFrame()
+        _render_audit_table(
+            df_models, "Model",
+            "Filter model standardisations (e.g. Dzire, Swift, Datson, Crysta, Tigor, Aspire, Etios)...",
+            "models",
+        )
+    with t_sel:
+        df_sellers = audit.get("sellers", pd.DataFrame()) if isinstance(audit, dict) else pd.DataFrame()
+        _render_audit_table(
+            df_sellers, "Seller",
+            "Filter seller standardisations (e.g. Aadhi, Popular, Castel, Balaji)...",
+            "sellers",
+        )
+    with t_buy:
+        df_buyers = audit.get("buyers", pd.DataFrame()) if isinstance(audit, dict) else pd.DataFrame()
+        _render_audit_table(
+            df_buyers, "Buyer",
+            "Filter buyer standardisations (e.g. AA Cars, Santhosh, Nirmal, Pine)...",
+            "buyers",
+        )
+    with t_mak:
+        df_makes = audit.get("makes", pd.DataFrame()) if isinstance(audit, dict) else pd.DataFrame()
+        _render_audit_table(
+            df_makes, "Make",
+            "Filter make standardisations (e.g. Maruti, VW, MG)...",
+            "makes",
+        )
+
+    # 4. Preview
+    st.markdown(T.section("Preview", "first 15 rows after normalisation"), unsafe_allow_html=True)
+    st.dataframe(df.drop(columns=[c for c in ("_month_idx",) if c in df.columns]).head(15),
+                 width="stretch", hide_index=True)
+
+    # 5. Actions & Export
+    st.markdown(T.section("Actions & Export", "take the normalised file with you or load into session"),
+                unsafe_allow_html=True)
+
+    base_name = os.path.splitext(source_name)[0]
+    clean_base = re.sub(r"[\s_]+(normalised|standardised)$", "", base_name, flags=re.IGNORECASE)
+    excel_bytes = export_normalised_cached(df, source_name, tuple(notes))
+    clean_csv = df.drop(columns=[c for c in df.columns if c.startswith("_")])
+
+    a, b, c = st.columns([1.2, 1.4, 1.0])
+    with a:
+        if not is_active_session:
+            if st.button("✓  Load this dataset", type="primary", width="stretch",
+                         help="Activate this dataset in the dashboard for this session"):
+                st.session_state.uploaded = df
+                st.session_state.uploaded_name = source_name
+                st.session_state.uploaded_notes = notes
+                st.rerun()
+        else:
+            st.success("✓ Dataset is currently loaded in active session")
+    with b:
+        st.download_button(
+            "⤓  Download normalised (Excel)",
+            data=excel_bytes,
+            file_name=f"{clean_base}_normalised.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+            key=f"dl_excel_{'active' if is_active_session else 'up'}",
+            help="Download the complete normalised dataset with formatted numbers, auto-filters, and audit log",
+        )
+    with c:
+        st.download_button(
+            "⤓  Download (CSV)",
+            data=clean_csv.to_csv(index=False).encode("utf-8"),
+            file_name=f"{clean_base}_normalised.csv",
+            mime="text/csv",
+            width="stretch",
+            key=f"dl_csv_{'active' if is_active_session else 'up'}",
+            help="Download normalised dataset as plain CSV",
+        )
+
+    st.markdown('<p class="small-note">The downloaded Excel file contains all parsed and standardised records '
+                'with formatted headers, auto-filters, and a dedicated normalisation audit sheet. '
+                'Loading replaces the active dataset for this session only; the bundled workbook on disk is untouched.</p>',
+                unsafe_allow_html=True)
+
+
 def tab_upload():
     hero("Bring your own workbook",
          "Drop in a conversion extract with the same shape as the template. "
@@ -704,27 +996,81 @@ def tab_upload():
          ['<span class="pill neutral"><span class="dot"></span>.xlsx / .xls</span>',
           '<span class="pill neutral">First sheet</span>'])
 
+    st.markdown(T.section("Standardised Data Entry Template", "Dropdown validations · auto-formulas · google sheets ready"), unsafe_allow_html=True)
+    
+    tcol_info, tcol_btn = st.columns([2.5, 1.2])
+    with tcol_info:
+        st.markdown(
+            '<div style="background:var(--surface-2); border:1px solid var(--border); border-radius:12px; padding:1.1rem 1.3rem;">'
+            '<div style="display:flex; align-items:center; gap:0.6rem; margin-bottom:0.5rem;">'
+            '<span style="font-size:1.1rem;">🛡️</span>'
+            '<strong style="font-size:0.95rem; color:var(--text);">Error-Proof Excel & Google Sheets Template</strong>'
+            '</div>'
+            '<p style="font-size:0.82rem; color:var(--muted); line-height:1.55; margin:0 0 0.6rem 0;">'
+            'Engineered with strict in-cell dropdown validations and automated Excel formulas to permanently eliminate human entry errors:'
+            '</p>'
+            '<ul style="margin:0; padding-left:1.2rem; font-size:0.8rem; color:var(--body); line-height:1.65;">'
+            '<li><b>Controlled Dropdowns:</b> FY, Month, State, Make, Model, and Seller Segment.</li>'
+            '<li><b>Strict Body Style Separation:</b> Maruti Swift (Hatchback) and Dzire (Sedan) are strictly separated, as are Tiago/Tigor and Etios/Liva.</li>'
+            '<li><b>Zero-Math Automated Formulas:</b> Enter only <code>Total Income (Ex GST)</code>. The template automatically calculates <code>Total Income (Inc GST)</code> and <code>GST (18%)</code> via formulas (<code>ROUND(M2*1.18, 2)</code>) — eliminating rounding discrepancies.</li>'
+            '<li><b>Google Sheets Compatible:</b> Open directly in Google Drive or MS Excel with active dropdowns and validations.</li>'
+            '</ul>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+    with tcol_btn:
+        try:
+            import create_template
+            tpl_data = create_template.get_template_bytes()
+            st.markdown('<div style="height:8px;"></div>', unsafe_allow_html=True)
+            st.download_button(
+                "⤓ Download Master Template (.xlsx)",
+                data=tpl_data,
+                file_name="Conversion_Data_Template_Master.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_master_template_card",
+                help="Download the Master template with in-cell dropdowns, auto-expanding lookup lists, strict Stop-level validations, instant search/autocomplete, auto-calculating GST formulas, and 2,500 pre-formatted rows. Compatible with Excel and Google Sheets.",
+                use_container_width=True
+            )
+            st.caption("Includes: • In-Cell Dropdowns Active • Auto-Expanding Lookups • Strict Stop Mode • Full Catalog (593 Buyers, 395 Sellers, 175 Models) • Auto-Formulas")
+
+
+
+        except Exception as e:
+            st.caption(f"Template generator: {e}")
+
+    st.markdown('<div style="height:12px;"></div>', unsafe_allow_html=True)
+
     spec = pd.DataFrame({
         "Column": DE.REQUIRED_COLUMNS,
         "Type": ["Text", "Text", "Text", "Text", "Text", "Text", "Text", "Text", "Text",
-                 "Number", "Number", "Number", "Number"],
-        "Example": ["FY27", "Jan", "TN", "TN01AB1234", "HYUNDAI", "i20",
-                    "Exchange Chennai", "Captive", "A. Kumar",
-                    "2018", "45000", "350000", "5084.75"],
+                 "Number", "Number", "Number", "Number", "Number"],
+        "Example": ["FY26", "Jan", "AP/TS", "AP31AS1112", "HYUNDAI", "Getz",
+                    "Exchange VIZAG", "Captive", "Gadi Sri Bharathi",
+                    "2007", "77543", "55000", "4237.29", "5000.00"],
         "Notes": ["FYnn format", "Jan…Dec, any case", "State or cluster code",
                   "Registration number", "Manufacturer", "Model name",
                   "Selling entity", "Captive / Non-Captive", "Buying party",
                   "Year of manufacture", "Kilometres", "Winning bid",
-                  "Commission, excluding GST"],
+                  "Commission income, excluding 18% GST",
+                  "Total platform income, including 18% GST"],
     })
-    with st.expander("◈  Expected template", expanded=False):
-        st.dataframe(spec, width="stretch", hide_index=True, height=500)
+    with st.expander("◈  Expected template schema & field dictionary", expanded=False):
+        st.dataframe(spec, width="stretch", hide_index=True, height=520)
         st.markdown('<p class="small-note">Banner rows above the header are skipped '
-                    'automatically. Extra columns are preserved and profiled in the '
-                    'Data Quality tab.</p>', unsafe_allow_html=True)
+                    'automatically. Both <code>Total Income (Ex GST)</code> and <code>Total Income</code> '
+                    'are supported — if only one is provided, the other is automatically calculated using 18% GST. '
+                    'Extra columns are preserved and profiled in the Data Quality tab.</p>', unsafe_allow_html=True)
+
 
     up = st.file_uploader("Workbook", type=["xlsx", "xls"], label_visibility="collapsed")
     if up is None:
+        if st.session_state.get("uploaded") is not None:
+            curr_df = st.session_state.uploaded
+            curr_name = st.session_state.get("uploaded_name", "Uploaded dataset")
+            curr_notes = list(st.session_state.get("uploaded_notes", []))
+            st.markdown(T.section("Active uploaded dataset in session", curr_name), unsafe_allow_html=True)
+            _render_upload_verification(curr_df, curr_notes, curr_name, is_active_session=True)
         return
 
     with st.spinner("Parsing and validating…"):
@@ -741,6 +1087,7 @@ def tab_upload():
     if errors:
         st.error("**Blocking issues — the file cannot be loaded:**\n\n"
                  + "\n".join(f"- {e}" for e in errors))
+        return
     else:
         st.success(f"Schema accepted. **{len(df):,}** usable records parsed.")
     for w in warnings:
@@ -750,40 +1097,7 @@ def tab_upload():
             for n in notes:
                 st.markdown(f"- {n}")
 
-    if errors:
-        return
-
-    m = DE.compute_metrics(df)
-    q = quality_of(df)
-    g_txt, g_acc = DE.grade(q["overall"])
-
-    cols = st.columns(5)
-    preview = [
-        ("Records", num(len(df)), "▦", "jade"),
-        ("GMV", inr(m["gmv"]), "◈", "violet"),
-        ("Commission revenue", inr(m["revenue"]), "◆", "amber"),
-        ("Unique sellers", num(m["unique_sellers"]), "⬢", "teal"),
-        ("Quality score", f"{q['overall']:.1f}%", "◉", g_acc),
-    ]
-    for col, (lbl, val, ico, acc) in zip(cols, preview):
-        with col:
-            st.markdown(T.kpi_card(lbl, val, ico, acc), unsafe_allow_html=True)
-
-    st.markdown(T.section("Preview", "first 15 rows after normalisation"),
-                unsafe_allow_html=True)
-    st.dataframe(df.drop(columns=[c for c in ("_month_idx",) if c in df.columns]).head(15),
-                 width="stretch", hide_index=True)
-
-    a, b = st.columns([1, 3])
-    with a:
-        if st.button("✓  Load this dataset", type="primary", width="stretch"):
-            st.session_state.uploaded = df
-            st.session_state.uploaded_name = up.name
-            st.rerun()
-    with b:
-        st.markdown('<p class="small-note">Loading replaces the active dataset for this '
-                    'session only. The bundled workbook on disk is never modified, and you '
-                    'can restore it any time from the sidebar.</p>', unsafe_allow_html=True)
+    _render_upload_verification(df, notes, up.name, raw_bytes=raw, is_active_session=False)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -886,7 +1200,8 @@ def tab_quality(df: pd.DataFrame, source_label: str, source_path: str | None,
         else:
             st.info("No numeric columns available for outlier analysis.")
 
-    pchart(C.outlier_box(df, ["Final Bid Value", "Total Income", "Odometer"]))
+    outlier_cols = [c for c in ("Final Bid Value", "Total Income (Ex GST)", "Total Income", "Odometer") if c in df.columns]
+    pchart(C.outlier_box(df, outlier_cols))
 
     # ── Uniqueness ──────────────────────────────────────────────────────
     st.markdown(T.section("Uniqueness", "duplicate detection at the vehicle grain"),
@@ -988,6 +1303,7 @@ def tab_quality(df: pd.DataFrame, source_label: str, source_path: str | None,
 def main():
     st.session_state.setdefault("uploaded", None)
     st.session_state.setdefault("uploaded_name", "")
+    st.session_state.setdefault("uploaded_notes", [])
 
     # Nothing below this line renders until a session is established: the whole
     # script runs server-side, so an unauthenticated visitor never receives the
@@ -997,7 +1313,7 @@ def main():
 
     if st.session_state.uploaded is not None:
         df = st.session_state.uploaded
-        notes: list[str] = []
+        notes = st.session_state.get("uploaded_notes", [])
         source_label = "Uploaded"
         source_path = st.session_state.uploaded_name or None
     else:

@@ -903,12 +903,12 @@ div[data-baseweb="popover"] li{color:var(--text) !important;}
 .stButton > button:hover, .stDownloadButton > button:hover{
   border-color:var(--jade-line); background:var(--jade-soft); color:var(--jade-text); transform:translateY(-1px);
 }
-.stButton > button[kind="primary"]{
+.stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"]{
   background:var(--primary-bg); color:var(--primary-text) !important; border:none;
   box-shadow:var(--primary-shadow);
 }
-.stButton > button[kind="primary"] p{color:var(--primary-text) !important;}
-.stButton > button[kind="primary"]:hover{box-shadow:var(--primary-shadow-hover);}
+.stButton > button[kind="primary"] p, .stDownloadButton > button[kind="primary"] p{color:var(--primary-text) !important;}
+.stButton > button[kind="primary"]:hover, .stDownloadButton > button[kind="primary"]:hover{box-shadow:var(--primary-shadow-hover);}
 
 /* File uploader */
 [data-testid="stFileUploaderDropzone"]{

@@ -53,11 +53,25 @@ class Reply:
 # ═════════════════════════════════════════════════════════════════════════════
 MEASURES: dict[str, dict] = {
     "revenue": dict(
-        label="Commission revenue", short="commission revenue",
+        label="Commission revenue (ex GST)", short="commission revenue",
         pf="Revenue", metric="revenue", fmt="inr",
         words=("commission revenue", "commission income", "revenue", "income",
-               "total income", "earnings", "commission earned", "platform income",
+               "commission", "earnings", "commission earned", "platform income",
+               "net revenue", "income ex gst", "total income ex gst", "total income (ex gst)",
                "top line", "topline"),
+    ),
+    "total_income": dict(
+        label="Total income (inc GST)", short="total income",
+        pf="TotalIncome", metric="total_income", fmt="inr",
+        words=("total income", "gross income", "income including gst",
+               "income with gst", "gross billing", "total billing",
+               "platform billing"),
+    ),
+    "gst": dict(
+        label="GST collected", short="GST",
+        pf="GST", metric="gst_amount", fmt="inr",
+        words=("gst", "gst collected", "tax", "gst amount", "tax collected",
+               "goods and services tax"),
     ),
     "gmv": dict(
         label="GMV", short="GMV",
@@ -369,17 +383,22 @@ def _breakdown(df: pd.DataFrame, dim: str, measure: str) -> pd.DataFrame:
         return pd.DataFrame()
     src = df[df[dim].notna()]
     g = src.groupby(dim, dropna=True, observed=False)
+    rev_col = "Total Income (Ex GST)" if "Total Income (Ex GST)" in src.columns else "Total Income"
     base = pd.DataFrame({
         "Deals": g.size(),
         "GMV": g["Final Bid Value"].sum(),
-        "Revenue": g["Total Income"].sum(),
+        "Revenue": g[rev_col].sum(),
         "AvgBid": g["Final Bid Value"].mean(),
-        "AvgCommission": g["Total Income"].mean(),
+        "AvgCommission": g[rev_col].mean(),
     })
+    if "Total Income" in src.columns:
+        base["TotalIncome"] = g["Total Income"].sum()
+    if "GST" in src.columns:
+        base["GST"] = g["GST"].sum()
     base["TakeRate"] = np.where(base["GMV"] > 0, base["Revenue"] / base["GMV"] * 100, np.nan)
     base["Transactions"] = base["Deals"]
     col = MEASURES[measure]["pf"]
-    base["value"] = base[col]
+    base["value"] = base[col] if col in base.columns else base["Revenue"]
     total = base["value"].sum()
     base["share"] = np.where(total > 0, base["value"] / total * 100, 0.0) \
         if MEASURES[measure]["fmt"] != "pct" else np.nan
@@ -541,24 +560,25 @@ def _h_howto(q: str, ctx: dict) -> Reply:
         html = (_p("Loading your own workbook:")
                 + _bullets([
                     "Open the <b>⤒ Upload Data</b> tab.",
-                    "Drop an <code>.xlsx</code> / <code>.xls</code> file with the 13 template "
+                    f"Drop an <code>.xlsx</code> / <code>.xls</code> file with the {len(DE.REQUIRED_COLUMNS)} template "
                     "columns — <b>FY, Month, State, Final Bid Value</b> and "
-                    "<b>Total Income</b> are the mandatory ones.",
-                    "The file is validated first: blocking errors are listed in red, "
-                    "cosmetic fixes (month casing, spacing, registration format) are "
-                    "applied automatically and reported.",
-                    "Press <b>Load this dataset</b> — every tab, filter and KPI rebinds to it.",
+                    "<b>Total Income (Ex GST) / Total Income</b> are the mandatory ones.",
+                    "The file is validated and normalised automatically: cosmetic fixes "
+                    "(month casing, whitespace, registration format) are applied and reported.",
+                    "Click <b>⤓ Download normalised (Excel)</b> to save the cleaned, formatted Excel workbook with audit log.",
+                    "Press <b>Load this dataset</b> to rebind all tabs, filters and KPIs to it.",
                     "<b>↺ Restore bundled dataset</b> in the sidebar puts the original back.",
                 ]))
         return Reply(html, ["What columns are required?", "How healthy is the data?"])
-    if _has(q, "export", "download", "csv", "excel out", "save data", "extract"):
+    if _has(q, "export", "download", "csv", "excel", "excel out", "save data", "extract"):
         return Reply(
-            _p("The <b>⬢ Sellers, Buyers &amp; Vehicles</b> tab ends with a download "
-               "button that exports exactly the rows surviving your current filters, "
-               "as CSV. Charts export individually too — hover any chart and use the "
-               "camera icon in its toolbar for a PNG.")
-            + _note("The export follows the filters, not the whole workbook. Clear the "
-                    "filters first if you want everything."),
+            _p("You can export data in several ways:")
+            + _bullets([
+                "<b>Normalised Workbook (Excel)</b> — in the <b>⤒ Upload Data</b> tab immediately after uploading (or in the sidebar while active), click <b>⤓ Download normalised (Excel)</b> to save the cleaned workbook with auto-filters and an audit log.",
+                "<b>Filtered slice (Excel &amp; CSV)</b> — the <b>⬢ Sellers, Buyers &amp; Vehicles</b> tab provides both Excel and CSV export buttons matching your active filters.",
+                "<b>Charts (PNG)</b> — hover any chart and click the camera icon in its Plotly toolbar.",
+            ])
+            + _note("The normalised Excel file includes all cleaned records and an ingestion audit trail sheet."),
             ["What filters are active?", "Give me a summary"])
     if _has(q, "filter", "filters", "narrow", "slice", "selection"):
         return Reply(
@@ -834,7 +854,8 @@ def _h_summary(q: str, ctx: dict) -> Reply:
 
     lines: list[str] = []
     if "State" in scope_df.columns and scope_df["State"].notna().any():
-        g = scope_df.groupby("State")["Total Income"].sum().sort_values(ascending=False)
+        rev_col = "Total Income (Ex GST)" if "Total Income (Ex GST)" in scope_df.columns else "Total Income"
+        g = scope_df.groupby("State")[rev_col].sum().sort_values(ascending=False)
         if g.sum():
             lines.append(f"<b>{escape(str(g.index[0]))}</b> leads geography with "
                          f"{inr(g.iloc[0])} of revenue ({g.iloc[0] / g.sum() * 100:.1f}% of the total).")
@@ -845,8 +866,9 @@ def _h_summary(q: str, ctx: dict) -> Reply:
             lines.append(f"The top 5 of {m['unique_sellers']:,} sellers carry "
                          f"<b>{top5:.1f}%</b> of GMV.")
     if "Seller Segment" in scope_df.columns and scope_df["Seller Segment"].nunique() > 1:
+        rev_col = "Total Income (Ex GST)" if "Total Income (Ex GST)" in scope_df.columns else "Total Income"
         seg = scope_df.groupby("Seller Segment").agg(
-            r=("Total Income", "sum"), g=("Final Bid Value", "sum"))
+            r=(rev_col, "sum"), g=("Final Bid Value", "sum"))
         seg["t"] = seg["r"] / seg["g"] * 100
         best = seg["t"].idxmax()
         lines.append(f"<b>{escape(str(best))}</b> sellers monetise better at "

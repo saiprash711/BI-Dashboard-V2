@@ -135,7 +135,8 @@ def plain_of(q: str) -> str:
 
 checks: list[tuple[str, str, str]] = []
 
-rev = df["Total Income"].sum()
+rev_col = "Total Income (Ex GST)" if "Total Income (Ex GST)" in df else "Total Income"
+rev = df[rev_col].sum()
 want = f"₹{rev/1e7:,.2f} Cr" if rev >= 1e7 else f"₹{rev/1e5:,.2f} L"
 checks.append(("total revenue overall", want,
                plain_of("what is the total commission revenue overall")))
@@ -144,7 +145,7 @@ gmv_f = fdf["Final Bid Value"].sum()
 want_gmv = f"₹{gmv_f/1e7:,.2f} Cr" if gmv_f >= 1e7 else f"₹{gmv_f/1e5:,.2f} L"
 checks.append(("filtered GMV", want_gmv, plain_of("total gmv")))
 
-top_state = (fdf.groupby("State")["Total Income"].sum().sort_values(ascending=False)
+top_state = (fdf.groupby("State")[rev_col].sum().sort_values(ascending=False)
              .index[0])
 checks.append(("top state by revenue", str(top_state), plain_of("top 5 states by revenue")))
 
@@ -166,7 +167,7 @@ checks.append(("state count", f"{n_states:,}", plain_of("how many states are the
 
 # The "revenue"/"VENUE" trap: a ranking must never be silently narrowed by an
 # approximate name match. Top state revenue must equal the plain pandas answer.
-top_rev = fdf.groupby("State")["Total Income"].sum().max()
+top_rev = fdf.groupby("State")[rev_col].sum().max()
 want_top = (f"₹{top_rev/1e7:,.2f} Cr" if top_rev >= 1e7
             else f"₹{top_rev/1e5:,.2f} L" if top_rev >= 1e5
             else f"₹{top_rev/1e3:,.1f} K")
@@ -180,11 +181,11 @@ checks.append(("comparison names both segments",
 checks.append(("comparison names second segment", segs[-1], cmp_txt))
 
 # A definition cue must reach the metric dictionary.
-checks.append(("definition of take rate", "SUM(Total Income) / SUM(Final Bid Value)",
+checks.append(("definition of take rate", "SUM(Total Income (Ex GST)) / SUM(Final Bid Value)",
                plain_of("define take rate")))
 
 # A bare metric question must return the number, not just the definition.
-tr = fdf["Total Income"].sum() / fdf["Final Bid Value"].sum() * 100
+tr = fdf[rev_col].sum() / fdf["Final Bid Value"].sum() * 100
 checks.append(("bare take rate returns value", f"{tr:,.2f}%", plain_of("take rate")))
 
 # Coverage must name the first and last period.
