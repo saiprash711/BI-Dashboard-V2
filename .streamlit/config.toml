@@ -1,0 +1,27 @@
+# Startup theme. Must mirror theme._DARK["native"] so the very first paint
+# matches the stylesheet; after that the in-app toggle rewrites these options
+# at runtime (see app.sync_native_theme).
+[theme]
+base = "dark"
+primaryColor = "#00E5A0"
+backgroundColor = "#08090B"
+secondaryBackgroundColor = "#15181D"
+textColor = "#F2F5F8"
+linkColor = "#4DE8D4"
+borderColor = "#23272E"
+dataframeBorderColor = "#23272E"
+dataframeHeaderBackgroundColor = "#1C2027"
+codeBackgroundColor = "#15181D"
+font = "sans serif"
+
+[server]
+headless = true
+port = 8501
+maxUploadSize = 200
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = true
