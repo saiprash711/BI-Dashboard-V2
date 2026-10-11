@@ -137,11 +137,19 @@ def _users() -> dict[str, dict[str, str]]:
 
     out: dict[str, dict[str, str]] = {}
     for username, spec in dict(block).items():
-        spec = dict(spec) if hasattr(spec, "keys") else {"hash": str(spec)}
-        if not spec.get("hash"):
+        if hasattr(spec, "keys"):
+            spec = dict(spec)
+        else:
+            val = str(spec)
+            spec = {"hash": val} if val.startswith(f"{_ALGO}$") else {"password": val}
+
+        pw_hash = spec.get("hash")
+        if not pw_hash and spec.get("password"):
+            pw_hash = hash_password(str(spec["password"]))
+        if not pw_hash:
             continue
         out[str(username).strip().lower()] = {
-            "hash": spec["hash"],
+            "hash": pw_hash,
             "name": spec.get("name", str(username).title()),
             "role": spec.get("role", "User"),
         }
